@@ -6,9 +6,10 @@ import os
 import time
 import math
 import asyncio
-from telegram import Update, MessageEntity
+import hashlib
+from telegram import Update, MessageEntity, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
-                          filters, ContextTypes, ConversationHandler)
+                          filters, ContextTypes, ConversationHandler, CallbackQueryHandler)
 from telegram.request import HTTPXRequest
 
 PROXY_URL = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
@@ -51,6 +52,14 @@ def save_config(data):
 def get_channel():
     return load_config().get("channel", "")
 
+def get_queue_enabled():
+    return bool(load_config().get("queue_enabled", False))
+
+def set_queue_enabled(value):
+    cfg = load_config()
+    cfg["queue_enabled"] = bool(value)
+    save_config(cfg)
+
 def get_egp_to_kwd():
     return load_config().get("egp_to_kwd", 160.0)
 
@@ -73,7 +82,8 @@ def clean_line(line):
     return line.replace(TATWEEL, '')
 
 def parse_number(s):
-    s = s.strip()
+    s = s.strip().translate(str.maketrans('٠١٢٣٤٥٦٧٨٩٫٬،', '0123456789.,,'))
+    s = s.rstrip('.,')
     if '.' in s and ',' in s:
         s = s.replace(',', '')
     elif ',' in s:
@@ -88,27 +98,47 @@ def parse_number(s):
             s = s.replace('.', '')
     return float(s)
 
-EGP_PATTERN = re.compile(
-    r"((?:ال)?\u0633\u0640*\u0639\u0640*\u0631\u0640*\s*(?:::\s*|:\s*|\s*))([\d,\.]+)\s*(?:جنيه|جنية|جنيها|ج\.م|ج(?!\w))?",
-    re.UNICODE
-)
+# طريقة قراءة السعر (منقولة من main.py): العملة قبل الرقم أو بعده، أو كلمة "السعر/سعر/price"
+_NUM = r'([0-9٠-٩][0-9٠-٩.,،٫٬]*)'
+_USD_LABELS = (r'(?:\$|US\$|(?<![A-Za-z])USDT(?![A-Za-z])|(?<![A-Za-z])TETHER(?![A-Za-z])|'
+               r'(?<![A-Za-z])USD(?![A-Za-z])|(?<![A-Za-z])US(?![A-Za-z])|U\.S\.|💵|💲|💸|💰|'
+               r'دولار(?:\s+أمريكي)?|دولارات|تيثر)')
+_EGP_LABELS = (r'(?:(?<![A-Za-z])EGP(?![A-Za-z])|(?<![A-Za-z])LE(?![A-Za-z])|جنيه(?:\s+مصري)?|جنيها|'
+               r'ج\.?\s*م\.?|مصري|مصرى|(?<![ء-يA-Za-z])ج(?![ء-يA-Za-z]))')
 
-# بيتعرف على السعر بالدولار بأي صيغة: $50 / 50$ / دولار: 50 / 50 دولار / 50 دولارات / 50 usdt / 50💵 / 💵50
-USD_PATTERN = re.compile(
-    r"\$\s*([\d,\.]+)"
-    r"|([\d,\.]+)\s*\$"
-    r"|(?:دولار(?:ات)?|usdt)\s*(?:::\s*|:\s*|\s*)([\d,\.]+)"
-    r"|([\d,\.]+)\s*(?:دولار(?:ات)?|usdt)"
-    r"|(?:💵|💸|🏦)\s*([\d,\.]+)"
-    r"|([\d,\.]+)\s*(?:💵|💸|🏦)",
-    re.UNICODE | re.IGNORECASE
-)
+def _label_patterns(labels):
+    return [
+        re.compile(rf'{labels}[ \t]*[:\-–—]*[ \t]*{_NUM}', re.IGNORECASE),
+        re.compile(rf'{_NUM}[ \t]*[:\-–—]*[ \t]*{labels}', re.IGNORECASE),
+    ]
 
-# ============================================================
-# طابور النشر: بيستقبل كل الحسابات اللي بتتبعت ويفرزها وينشرها واحد كل دقيقة
-# ============================================================
-publish_queue = asyncio.Queue()
-QUEUE_INTERVAL_SECONDS = 60  # المدة بين نشر حساب واللي بعده
+USD_PATTERNS = _label_patterns(_USD_LABELS)
+EGP_PATTERNS = _label_patterns(_EGP_LABELS)
+PRICE_WORD_PATTERN = re.compile(r'(السعر|سعر|price)[ \t]*[:\-–—]*[ \t]*' + _NUM, re.IGNORECASE)
+
+def _first_match_value(patterns, text):
+    ms = [m for m in (p.search(text) for p in patterns) if m]
+    if not ms:
+        return None
+    m = min(ms, key=lambda x: x.start())
+    return next((g for g in m.groups() if g), None)
+
+def find_price_in_line(line):
+    """بترجع ("USD" أو "EGP", القيمة) أو None. نفس ترتيب main.py: دولار، جنيه، وبعدين كلمة السعر."""
+    for cur, patterns in (("USD", USD_PATTERNS), ("EGP", EGP_PATTERNS)):
+        val = _first_match_value(patterns, line)
+        if val:
+            try:
+                return cur, parse_number(val)
+            except Exception:
+                pass
+    m = PRICE_WORD_PATTERN.search(line)
+    if m:
+        try:
+            return ("USD" if m.group(1).lower() == "price" else "EGP"), parse_number(m.group(2))
+        except Exception:
+            pass
+    return None
 
 # ============================================================
 # أدوات لحساب المسافات بنظام UTF-16 (زي ما تليجرام بيحسب الـ entities)
@@ -233,25 +263,9 @@ def build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd):
 
     for i in range(search_start, len(lines)):
         cl = clean_line(lines[i])
-        # لو في علامة $ أو كلمة "دولار"/"usdt" أو إيموجي فلوس اعتبره سعر بالدولار (نتأكد
-        # منه الأول عشان ما نغلطش نفسره كجنيه لو السطر فيه كلمة "سعر" برضو)
-        m_usd = USD_PATTERN.search(cl)
-        matched_usd = False
-        if m_usd:
-            val = next((g for g in m_usd.groups() if g), None)
-            if val:
-                try:
-                    matches_by_currency["USD"].append((i, parse_number(val)))
-                    matched_usd = True
-                except Exception:
-                    pass
-        if not matched_usd:
-            m_egp = EGP_PATTERN.search(cl)
-            if m_egp:
-                try:
-                    matches_by_currency["EGP"].append((i, parse_number(m_egp.group(2))))
-                except Exception:
-                    pass
+        found = find_price_in_line(cl)
+        if found:
+            matches_by_currency[found[0]].append((i, found[1]))
 
     # كل عملة موجودة (جنيه و/أو دولار) بتتحول لوحدها للدينار الكويتي + الدولار مع الربح.
     # لو نفس العملة اتكررت في أكتر من سطر، أول سطر بيتحول والباقي (أسعار قديمة) بيتمسح.
@@ -332,6 +346,65 @@ def get_session(chat_id, reset=False):
         pending_sessions[chat_id]["last_time"] = now
     return pending_sessions[chat_id]
 
+# ============================================================
+# منع التكرار: نفس الحساب (نفس الصورة/الفيديو أو نفس الوصف) ما يتنشرش تاني خلال 48 ساعة
+# ============================================================
+DEDUP_HOURS = 48
+DEDUP_BY_MEDIA = True    # نفس الصورة أو الفيديو
+DEDUP_BY_CAPTION = True  # نفس الوصف (من غير سطور السعر والتواصل)
+PUBLISHED_FILE = os.path.join(os.path.dirname(CONFIG_FILE) or ".", "published.json")
+
+def _load_published():
+    try:
+        with open(PUBLISHED_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_published(data):
+    folder = os.path.dirname(PUBLISHED_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(PUBLISHED_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def caption_fingerprint(caption):
+    kept = []
+    for line in clean_line(caption or "").split("\n"):
+        if "للتواصل" in line or find_price_in_line(line):
+            continue
+        kept.append(line)
+    text = re.sub(r"\s+", " ", " ".join(kept)).strip().lower()
+    return ("c:" + hashlib.md5(text.encode("utf-8")).hexdigest()) if text else None
+
+def dedup_keys(session):
+    keys = []
+    if DEDUP_BY_MEDIA:
+        keys += ["m:" + u for u in session.get("uids", [])]
+    if DEDUP_BY_CAPTION:
+        fp = caption_fingerprint(session.get("caption", ""))
+        if fp:
+            keys.append(fp)
+    return keys
+
+def check_and_mark_published(keys):
+    """True = الحساب جديد (واتسجل)، False = اتنشر قبل كده خلال المدة."""
+    now = time.time()
+    data = {k: v for k, v in _load_published().items() if now - v < DEDUP_HOURS * 3600}
+    if any(k in data for k in keys):
+        _save_published(data)
+        return False
+    for k in keys:
+        data[k] = now
+    _save_published(data)
+    return True
+
+def forget_published(keys):
+    data = _load_published()
+    for k in keys:
+        data.pop(k, None)
+    _save_published(data)
+
 async def schedule_publish(context, chat_id, generation):
     """بينتظر شوية عشان يلحق يجمع كل عناصر الألبوم (صور+فيديو) قبل النشر.
     بيستخدم رقم "جيل" عشان يضمن إن نشر واحد بس هو اللي بيحصل، حتى لو
@@ -347,14 +420,22 @@ async def schedule_publish(context, chat_id, generation):
         # نمسح الجلسة فورًا (قبل أي await) عشان نضمن إن مفيش task تاني
         # ممكن يعدّي نفس الشرط وينشر مرة تانية
         pending_sessions.pop(chat_id, None)
-        await enqueue_publish(context, chat_id, session)
+        await submit_publish(context, chat_id, session)
 
 # ============================================================
-# طابور النشر: كل حساب بيتضاف للطابور وبينشر واحد كل دقيقة بالترتيب
+# الطابور (بيتشغّل ويتقفل من زرار في /menu): كل حساب بيتنشر بعد اللي قبله بدقيقة
 # ============================================================
+publish_queue = asyncio.Queue()
+QUEUE_INTERVAL_SECONDS = 60  # المدة بين نشر حساب واللي بعده
+
+async def submit_publish(context, chat_id, session):
+    """لو الطابور شغال الحساب بيتضاف له، ولو مقفول بيتنشر فورًا."""
+    if get_queue_enabled():
+        await enqueue_publish(context, chat_id, session)
+    else:
+        await do_publish(context, chat_id, session)
+
 async def enqueue_publish(context, chat_id, session):
-    """بيضيف الحساب لطابور النشر بدل ما ينشره فورًا، وبيرد على اليوزر
-    بترتيبه في الطابور."""
     position = publish_queue.qsize() + 1
     await publish_queue.put((chat_id, session))
     if position == 1:
@@ -367,8 +448,7 @@ async def enqueue_publish(context, chat_id, session):
         )
 
 async def queue_worker(app):
-    """بيشتغل طول الوقت في الخلفية، بيسحب حساب من الطابور وينشره،
-    وبعدين بيستنى دقيقة قبل ما ينشر اللي بعده."""
+    """شغال طول الوقت في الخلفية: بيسحب حساب من الطابور وينشره وبعدين يستنى دقيقة."""
     while True:
         chat_id, session = await publish_queue.get()
         try:
@@ -382,12 +462,24 @@ async def queue_worker(app):
 async def post_init(app):
     asyncio.create_task(queue_worker(app))
 
-async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    size = publish_queue.qsize()
-    if size == 0:
-        await update.message.reply_text("📭 الطابور فاضي دلوقتي.")
-    else:
-        await update.message.reply_text(f"📬 في {size} حساب مستني في الطابور.")
+def menu_content():
+    enabled = get_queue_enabled()
+    status = "🟢 شغال (حساب كل دقيقة)" if enabled else "🔴 مقفول (النشر فوري)"
+    text = f"⚙️ الإعدادات\n\n📬 الطابور: {status}\n⏳ مستني في الطابور: {publish_queue.qsize()}"
+    label = "⏹ إيقاف الطابور" if enabled else "▶️ تشغيل الطابور"
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="toggle_queue")]])
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = menu_content()
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+async def toggle_queue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    new_state = not get_queue_enabled()
+    set_queue_enabled(new_state)
+    await query.answer("✅ الطابور اتشغّل" if new_state else "⏹ الطابور اتقفل")
+    text, keyboard = menu_content()
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -478,7 +570,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ مفيش وصف. ابعت الوصف الأول.")
         return
     session = pending_sessions.pop(chat_id, None)
-    await enqueue_publish(context, chat_id, session)
+    await submit_publish(context, chat_id, session)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel = get_channel()
@@ -495,8 +587,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if message.photo:
         session["photos"].append(message.photo[-1].file_id)
+        session.setdefault("uids", []).append(message.photo[-1].file_unique_id)
     elif message.video:
         session["videos"].append(message.video.file_id)
+        session.setdefault("uids", []).append(message.video.file_unique_id)
 
     # لو في وصف مع الميديا خزّنه (مع الـ entities عشان الإيموجي المميز)
     if caption.strip():
@@ -551,6 +645,14 @@ async def do_publish(context, chat_id, session):
     videos = session["videos"]
     caption = session["caption"]
     entities = session.get("entities") or []
+
+    keys = dedup_keys(session)
+    if keys and not check_and_mark_published(keys):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🚫 الحساب ده اتنشر قبل كده خلال آخر {DEDUP_HOURS} ساعة، فما اتنشرش تاني."
+        )
+        return
 
     new_caption, new_entities = build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd)
 
@@ -619,6 +721,8 @@ async def do_publish(context, chat_id, session):
 
     except Exception as e:
         logger.error(f"Publish error: {e}")
+        if keys:
+            forget_published(keys)
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ مشكلة في النشر:\n{str(e)}")
 
 # ============================================================
@@ -652,7 +756,8 @@ def main():
     app.add_handler(CommandHandler("setchannel", setchannel_command))
     app.add_handler(CommandHandler("rate", rate_command))
     app.add_handler(CommandHandler("publish", publish_command))
-    app.add_handler(CommandHandler("queue", queue_command))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CallbackQueryHandler(toggle_queue_callback, pattern="^toggle_queue$"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
