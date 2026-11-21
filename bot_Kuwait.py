@@ -18,6 +18,7 @@ OWNER_USERNAME = "@bobeka11"
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # عشان التوكن ما يظهرش في اللوجات
 logger = logging.getLogger(__name__)
 
 ASK_CHANNEL = 0
@@ -41,6 +42,9 @@ def load_config():
         return json.load(f)
 
 def save_config(data):
+    folder = os.path.dirname(CONFIG_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
