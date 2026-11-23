@@ -16,6 +16,8 @@ PROXY_URL = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_USERNAME = "@bobeka11"
+STRIP_OTHER_USERNAMES = True  # يمسح أي يوزر/رابط تليجرام تاني (يوزرات التجار) ويسيب يوزرك بس
+USERNAME_RE = re.compile(r"(?:https?://)?t\.me/[A-Za-z0-9_+/]+|@[A-Za-z0-9_]{4,}")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 
 logging.basicConfig(level=logging.INFO)
@@ -34,13 +36,27 @@ POST_TIMEOUT = 5  # ثواني - لو الفرق أكبر من كده يعتبر
 DEBOUNCE_SECONDS = 1.5  # وقت الاستنى قبل النشر عشان نلحق نجمع كل عناصر الألبوم
 
 # ============================================================
+def _env_defaults():
+    """القناة وسعر الدينار الأساسيين من متغيرات البيئة (CHANNEL و EGP_TO_KWD)،
+    عشان البوت ما يسألش عنهم تاني حتى لو ملف الإعدادات اتمسح."""
+    try:
+        rate = float(os.environ.get("EGP_TO_KWD", "160").replace(",", "."))
+    except ValueError:
+        rate = 160.0
+    channel = os.environ.get("CHANNEL", "").strip()
+    return {"channel": normalize_channel(channel) if channel else "", "egp_to_kwd": rate}
+
 def load_config():
+    default = _env_defaults()
     if not os.path.exists(CONFIG_FILE):
-        default = {"channel": "", "egp_to_kwd": 160.0}
         save_config(default)
         return default
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    for key, value in default.items():
+        if not cfg.get(key):
+            cfg[key] = value
+    return cfg
 
 def save_config(data):
     folder = os.path.dirname(CONFIG_FILE)
@@ -257,22 +273,22 @@ def build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd):
     edits = []  # (start_u16, end_u16, new_text)
     text_edits_char = []  # (start_c, end_c, new_text) - نفس التعديلات بس بمواضع بايثون
 
-    # بندور على كل سطور الأسعار (جنيه أو دولار) في آخر 4 سطور بس، وبنجمعهم كل عملة لوحدها
+    lines_to_remove = set()  # سطور هتتمسح بالكامل (سعر قديم / يوزر تاجر)
+    edited_lines = set()     # سطور اتعدّلت (سعر / تواصل)
+
+    # بندور على سعر الحساب في آخر 4 سطور بس. السعر بيظهر مرة واحدة بس:
+    # أول سطر سعر هو اللي بيتحول، وأي سطور سعر تانية (جنيه/دولار/قديم) بتتمسح عشان ما يتكررش.
     search_start = max(0, len(lines) - 4)
-    matches_by_currency = {"EGP": [], "USD": []}  # currency -> [(line_idx, value), ...]
-
+    found_prices = []  # (line_idx, currency, value)
     for i in range(search_start, len(lines)):
-        cl = clean_line(lines[i])
-        found = find_price_in_line(cl)
-        if found:
-            matches_by_currency[found[0]].append((i, found[1]))
-
-    # كل عملة موجودة (جنيه و/أو دولار) بتتحول لوحدها للدينار الكويتي + الدولار مع الربح.
-    # لو نفس العملة اتكررت في أكتر من سطر، أول سطر بيتحول والباقي (أسعار قديمة) بيتمسح.
-    for currency, matches in matches_by_currency.items():
-        if not matches:
+        if "للتواصل" in lines[i]:
             continue
-        price_line_idx, price_value = matches[0]
+        found = find_price_in_line(clean_line(lines[i]))
+        if found:
+            found_prices.append((i, found[0], found[1]))
+
+    if found_prices:
+        price_line_idx, currency, price_value = found_prices[0]
         if currency == "USD":
             kwd_val = math.ceil((price_value / usd_per_kwd) * 1.7)
         else:  # EGP
@@ -285,12 +301,9 @@ def build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd):
         new_price_text = f"السعر :: {kwd_val} دينار كويتي 🇰🇼\n𝑼𝑺𝑫𝑻 :: {usd_val} $ 🇺🇸"
         edits.append((offset_map[start_c], offset_map[end_c], new_price_text))
         text_edits_char.append((start_c, end_c, new_price_text))
-
-        # أي سطور مكررة لنفس العملة في نفس النطاق (آخر 4 سطور) بتتمسح تمامًا
-        old_indices = sorted(idx for (idx, _) in matches[1:])
-        for (s_c, e_c) in line_removal_ranges(old_indices, lines, line_char_starts):
-            edits.append((offset_map[s_c], offset_map[e_c], ""))
-            text_edits_char.append((s_c, e_c, ""))
+        edited_lines.add(price_line_idx)
+        for (idx, _, _) in found_prices[1:]:
+            lines_to_remove.add(idx)
 
     contact_line = f"للتواصل : {OWNER_USERNAME} ✅"
     found_contact = False
@@ -300,6 +313,7 @@ def build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd):
             end_c = start_c + len(line)
             edits.append((offset_map[start_c], offset_map[end_c], contact_line))
             text_edits_char.append((start_c, end_c, contact_line))
+            edited_lines.add(i)
             found_contact = True
             break
 
@@ -307,6 +321,33 @@ def build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd):
         end_c = len(caption)
         edits.append((offset_map[end_c], offset_map[end_c], f"\n{contact_line}"))
         text_edits_char.append((end_c, end_c, f"\n{contact_line}"))
+
+    # مسح يوزرات/روابط التجار التانيين (غير يوزرك) من باقي الوصف
+    if STRIP_OTHER_USERNAMES:
+        owner = OWNER_USERNAME.lower()
+        for i, line in enumerate(lines):
+            if i in edited_lines or i in lines_to_remove:
+                continue
+            all_found = list(USERNAME_RE.finditer(line))
+            if not all_found:
+                continue
+            others = [m for m in all_found if m.group(0).lower() != owner]
+            rest = USERNAME_RE.sub("", line)
+            if not re.search(r"\w", rest):
+                lines_to_remove.add(i)  # السطر كله يوزر/رابط (حتى يوزرك لأنه موجود في سطر التواصل)
+            elif others and re.search(r"تواصل|للشراء|للطلب|للاستفسار|كلمني|راسلني|خاص", line):
+                lines_to_remove.add(i)  # سطر تواصل بيوزر تاجر
+            else:
+                for m in others:
+                    s_c = line_char_starts[i] + m.start()
+                    e_c = line_char_starts[i] + m.end()
+                    edits.append((offset_map[s_c], offset_map[e_c], ""))
+                    text_edits_char.append((s_c, e_c, ""))
+
+    # مسح السطور المطلوبة مرة واحدة (عشان ما يحصلش تداخل بين النطاقات)
+    for (s_c, e_c) in line_removal_ranges(sorted(lines_to_remove), lines, line_char_starts):
+        edits.append((offset_map[s_c], offset_map[e_c], ""))
+        text_edits_char.append((s_c, e_c, ""))
 
     new_text = caption
     for (start_c, end_c, repl) in sorted(text_edits_char, key=lambda x: -x[0]):
@@ -654,9 +695,8 @@ async def do_publish(context, chat_id, session):
         )
         return
 
-    new_caption, new_entities = build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd)
-
     try:
+        new_caption, new_entities = build_new_caption(caption, entities, egp_to_kwd, usd_per_kwd)
         await context.bot.send_message(chat_id=chat_id, text="⏳ جاري النشر...")
 
         # لو في صور بس
